@@ -29,7 +29,11 @@ import { asResolvedSourceConfig, asRuntimeConfig } from "../../config/materializ
 import { CONFIG_PATH, resolveIncludeRoots } from "../../config/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../../config/types.plugins.js";
-import { GATEWAY_SERVICE_KIND, GATEWAY_SERVICE_MARKER } from "../../daemon/constants.js";
+import {
+  GATEWAY_SERVICE_KIND,
+  GATEWAY_SERVICE_MARKER,
+  GATEWAY_SERVICE_RUNTIME_PID_ENV,
+} from "../../daemon/constants.js";
 import { resolveGatewayInstallEntrypoint } from "../../daemon/gateway-entrypoint.js";
 import { disableCurrentOpenClawUpdateLaunchdJob } from "../../daemon/launchd.js";
 import { resolveGatewayRestartLogPath } from "../../daemon/restart-logs.js";
@@ -70,7 +74,6 @@ import {
   createGlobalInstallEnv,
   cleanupGlobalRenameDirs,
   globalInstallArgs,
-  isOpenClawSourcePackageInstallSpec,
   resolveGlobalInstallTarget,
   resolveGlobalInstallSpec,
   resolvePnpmGlobalDirFromGlobalRoot,
@@ -93,6 +96,7 @@ import {
 } from "../../plugins/update.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
+import { isRecord } from "../../shared/record-coerce.js";
 import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import { stylePromptMessage } from "../../terminal/prompt-style.js";
 import { theme } from "../../terminal/theme.js";
@@ -230,10 +234,6 @@ function isTrackedPackageInstallRecord(record: PluginInstallRecord): boolean {
     record.source === "git" ||
     record.source === "marketplace"
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function normalizePluginInstallRecordMap(value: unknown): Record<string, PluginInstallRecord> {
@@ -770,8 +770,40 @@ Gateway PID ${pid} is an ancestor of this process, so this updater cannot safely
 Run \`${replaceCliName(formatCliCommand("openclaw update"), CLI_NAME)}\` from a shell outside the gateway service, or stop the gateway service first and then update.`;
 }
 
-function isGatewayAncestorPid(pid: unknown): pid is number {
-  return typeof pid === "number" && pid > 0 && getSelfAndAncestorPidsSync().has(pid);
+function parsePositivePid(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!/^\d+$/u.test(trimmed)) {
+    return null;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function isInheritedGatewayRuntimePid(
+  pid: number,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (!isRunningInsideGatewayService(env)) {
+    return false;
+  }
+  return parsePositivePid(env[GATEWAY_SERVICE_RUNTIME_PID_ENV]) === pid;
+}
+
+function isGatewayAncestorPid(
+  pid: unknown,
+  env: Record<string, string | undefined> = process.env,
+): pid is number {
+  const parsed = parsePositivePid(pid);
+  if (parsed === null) {
+    return false;
+  }
+  return isInheritedGatewayRuntimePid(parsed, env) || getSelfAndAncestorPidsSync().has(parsed);
 }
 
 function gatewayAncestryBlockMessage(pid: unknown): string | undefined {
@@ -990,14 +1022,6 @@ async function resolvePackageRuntimePreflightError(params: {
   ].join("\n");
 }
 
-function formatUnsupportedOpenClawSourcePackageTargetMessage(target: string): string {
-  return [
-    `Unsupported package update target: ${target}.`,
-    "OpenClaw package updates use published npm artifacts or built tarballs; npm GitHub source installs for openclaw/openclaw do not reliably produce an installable package.",
-    "Use `openclaw update --channel dev` for the moving main checkout, or target `latest`, `beta`, an exact version, or a built `.tgz` package spec.",
-  ].join("\n");
-}
-
 async function resolvePackageRuntimeForPreflight(params: {
   nodeRunner?: string;
   timeoutMs?: number;
@@ -1048,6 +1072,7 @@ function stripGatewayServiceMarkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
   const resolvedEnv = { ...env };
   delete resolvedEnv.OPENCLAW_SERVICE_MARKER;
   delete resolvedEnv.OPENCLAW_SERVICE_KIND;
+  delete resolvedEnv[GATEWAY_SERVICE_RUNTIME_PID_ENV];
   return resolvedEnv;
 }
 
@@ -1084,6 +1109,17 @@ export function resolveUpdatedGatewayRestartPort(params: {
   serviceEnv?: NodeJS.ProcessEnv;
 }): number {
   return resolveGatewayPort(params.config, params.serviceEnv ?? params.processEnv ?? process.env);
+}
+
+export function resolvePostUpdateServiceStateReadEnv(params: {
+  updateMode: UpdateRunResult["mode"];
+  processEnv?: NodeJS.ProcessEnv;
+  prePackageServiceEnv?: NodeJS.ProcessEnv;
+}): NodeJS.ProcessEnv {
+  if (isPackageManagerUpdateMode(params.updateMode) && params.prePackageServiceEnv) {
+    return params.prePackageServiceEnv;
+  }
+  return params.processEnv ?? process.env;
 }
 
 type UpdateDryRunPreview = {
@@ -2711,6 +2747,7 @@ async function continuePostCoreUpdateInFreshProcess(params: {
       stdio: childStdio,
       env: {
         ...stripGatewayServiceMarkerEnv(disableUpdatedPackageCompileCacheEnv(process.env)),
+        OPENCLAW_UPDATE_IN_PROGRESS: "1",
         [POST_CORE_UPDATE_ENV]: "1",
         [POST_CORE_UPDATE_CHANNEL_ENV]: params.channel,
         ...(params.requestedChannel
@@ -2867,7 +2904,25 @@ async function markControlPlaneUpdateRestartSentinelFailureBestEffort(params: {
   }
 }
 
+async function withUpdateInProgressEnv<T>(run: () => Promise<T>): Promise<T> {
+  const previousUpdateInProgress = process.env.OPENCLAW_UPDATE_IN_PROGRESS;
+  process.env.OPENCLAW_UPDATE_IN_PROGRESS = "1";
+  return run().finally(() => {
+    if (previousUpdateInProgress === undefined) {
+      delete process.env.OPENCLAW_UPDATE_IN_PROGRESS;
+    } else {
+      process.env.OPENCLAW_UPDATE_IN_PROGRESS = previousUpdateInProgress;
+    }
+  });
+}
+
 export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
+  return await withUpdateInProgressEnv(async () => {
+    await updateCommandInternal(opts);
+  });
+}
+
+async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> {
   suppressDeprecations();
   await cleanupStaleManagedServiceUpdateHandoffs().catch(() => undefined);
   const invocationCwd = tryResolveInvocationCwd();
@@ -2911,7 +2966,10 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
 
     process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION = (await readPackageVersion(root)) ?? VERSION;
 
-    let postCoreConfigSnapshot = await readConfigFileSnapshot({ skipPluginValidation: true });
+    let postCoreConfigSnapshot = await readConfigFileSnapshot({
+      skipPluginValidation: true,
+      suppressFutureVersionWarning: true,
+    });
     const preUpdateSourceConfig = await readPostCorePreUpdateSourceConfig({
       sourceConfigPath: process.env[POST_CORE_UPDATE_SOURCE_CONFIG_PATH_ENV],
       currentSnapshot: postCoreConfigSnapshot,
@@ -3102,11 +3160,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
       tag,
       env: process.env,
     });
-    if (isOpenClawSourcePackageInstallSpec(packageInstallSpec)) {
-      defaultRuntime.error(formatUnsupportedOpenClawSourcePackageTargetMessage(packageInstallSpec));
-      defaultRuntime.exit(1);
-      return;
-    }
   }
 
   if (opts.dryRun) {
@@ -3382,7 +3435,10 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
 
   let postUpdateConfigSnapshot =
     result.status === "ok" && !opts.dryRun
-      ? await readConfigFileSnapshot({ skipPluginValidation: true })
+      ? await readConfigFileSnapshot({
+          skipPluginValidation: true,
+          suppressFutureVersionWarning: shouldResumePostCoreInFreshProcess,
+        })
       : configSnapshot;
   if (!shouldResumePostCoreInFreshProcess) {
     postUpdateConfigSnapshot = await persistRequestedUpdateChannel({
@@ -3502,7 +3558,11 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
   if (shouldRestart) {
     try {
       const serviceState = await readGatewayServiceState(resolveGatewayService(), {
-        env: process.env,
+        env: resolvePostUpdateServiceStateReadEnv({
+          updateMode: resultWithPostUpdate.mode,
+          processEnv: process.env,
+          prePackageServiceEnv: prePackageServiceStop?.serviceEnv,
+        }),
       });
       if (
         shouldPrepareUpdatedInstallRestart({

@@ -21,8 +21,12 @@ import {
   type ToolProgressDetailMode,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { emitTrustedDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
+import {
+  asBoolean,
+  asFiniteNumber,
+  normalizeStringEntries,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveCodexLocalRuntimeAttribution } from "./local-runtime-attribution.js";
-import { CodexNativeSubagentTaskMirror } from "./native-subagent-task-mirror.js";
 import {
   readCodexNotificationThreadId,
   readCodexNotificationTurnId,
@@ -147,7 +151,10 @@ export class CodexAppServerEventProjector {
     { chars: number; messages: number; truncated: boolean }
   >();
   private readonly toolResultOutputTextByItem = new Map<string, string>();
-  private readonly toolMetas = new Map<string, { toolName: string; meta?: string }>();
+  private readonly toolMetas = new Map<
+    string,
+    { toolName: string; meta?: string; asyncStarted?: boolean }
+  >();
   private readonly sideEffectingToolItemIds = new Set<string>();
   private readonly sideEffectingDynamicToolCallIds = new Set<string>();
   private readonly toolTranscriptMessages: AgentMessage[] = [];
@@ -169,33 +176,22 @@ export class CodexAppServerEventProjector {
   private guardianReviewCount = 0;
   private completedCompactionCount = 0;
   private latestRateLimits: JsonValue | undefined;
-  private readonly nativeSubagentTaskMirror: CodexNativeSubagentTaskMirror;
 
   constructor(
     private readonly params: EmbeddedRunAttemptParams,
     private readonly threadId: string,
     private readonly turnId: string,
     private readonly options: CodexAppServerEventProjectorOptions = {},
-  ) {
-    this.nativeSubagentTaskMirror = new CodexNativeSubagentTaskMirror({
-      parentThreadId: threadId,
-      requesterSessionKey: params.sessionKey,
-      agentId: params.agentId,
-    });
+  ) {}
+
+  getCompletedTurnStatus(): CodexTurn["status"] | undefined {
+    return this.completedTurn?.status;
   }
 
   async handleNotification(notification: CodexServerNotification): Promise<void> {
     const params = isJsonObject(notification.params) ? notification.params : undefined;
     if (!params) {
       return;
-    }
-    try {
-      this.nativeSubagentTaskMirror.handleNotification(notification);
-    } catch (error) {
-      embeddedAgentLog.warn("Failed to mirror Codex native subagent lifecycle event", {
-        method: notification.method,
-        error: formatErrorMessage(error),
-      });
     }
     if (notification.method === "account/rateLimits/updated") {
       this.latestRateLimits = params;
@@ -387,11 +383,20 @@ export class CodexAppServerEventProjector {
   recordDynamicToolResult(params: {
     callId: string;
     tool: string;
+    asyncStarted?: boolean;
     success: boolean;
     terminalType?: "blocked" | "completed" | "error";
     sideEffectEvidence?: boolean;
     contentItems: CodexDynamicToolCallOutputContentItem[];
   }): void {
+    const existingMeta = this.toolMetas.get(params.callId);
+    this.toolMetas.set(params.callId, {
+      toolName: params.tool,
+      ...(existingMeta?.meta ? { meta: existingMeta.meta } : {}),
+      ...(existingMeta?.asyncStarted === true || params.asyncStarted === true
+        ? { asyncStarted: true }
+        : {}),
+    });
     this.recordToolTranscriptResult({
       id: params.callId,
       name: params.tool,
@@ -807,9 +812,7 @@ export class CodexAppServerEventProjector {
   }
 
   private buildToolMediaUrls(toolTelemetry: CodexAppServerToolTelemetry): string[] | undefined {
-    const mediaUrls = new Set(
-      toolTelemetry.toolMediaUrls?.map((url) => url.trim()).filter(Boolean) ?? [],
-    );
+    const mediaUrls = new Set(normalizeStringEntries(toolTelemetry.toolMediaUrls ?? []));
     if ((toolTelemetry.messagingToolSentMediaUrls?.length ?? 0) === 0) {
       for (const mediaUrl of this.nativeGeneratedMediaUrls) {
         mediaUrls.add(mediaUrl);
@@ -1222,9 +1225,11 @@ export class CodexAppServerEventProjector {
       return;
     }
     const meta = itemMeta(item, this.toolProgressDetailMode());
+    const existingMeta = this.toolMetas.get(item.id);
     this.toolMetas.set(item.id, {
       toolName,
       ...(meta ? { meta } : {}),
+      ...(existingMeta?.asyncStarted === true ? { asyncStarted: true } : {}),
     });
     if (isSideEffectingNativeToolItem(item)) {
       this.sideEffectingToolItemIds.add(item.id);
@@ -1234,7 +1239,7 @@ export class CodexAppServerEventProjector {
   }
 
   private recordNativeToolTranscriptCall(item: CodexThreadItem | undefined): void {
-    if (!item || !shouldSynthesizeToolProgressForItem(item)) {
+    if (!item || !shouldRecordNativeToolTranscript(item)) {
       return;
     }
     const name = itemName(item);
@@ -1249,7 +1254,7 @@ export class CodexAppServerEventProjector {
   }
 
   private recordNativeToolTranscriptResult(item: CodexThreadItem | undefined): void {
-    if (!item || !shouldSynthesizeToolProgressForItem(item)) {
+    if (!item || !shouldRecordNativeToolTranscript(item)) {
       return;
     }
     const name = itemName(item);
@@ -1544,6 +1549,32 @@ function readString(record: JsonObject, key: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function normalizeNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  return value.trim() || undefined;
+}
+
+function readNonEmptyString(record: JsonObject, key: string): string | undefined {
+  return normalizeNonEmptyString(record[key]);
+}
+
+function readNonEmptyStringArray(record: JsonObject, key: string): string[] {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const entries: string[] = [];
+  for (const entry of value) {
+    const normalized = normalizeNonEmptyString(entry);
+    if (normalized) {
+      entries.push(normalized);
+    }
+  }
+  return entries;
+}
+
 function readNullableString(record: JsonObject, key: string): string | null | undefined {
   const value = record[key];
   if (value === null) {
@@ -1553,13 +1584,11 @@ function readNullableString(record: JsonObject, key: string): string | null | un
 }
 
 function readNumber(record: JsonObject, key: string): number | undefined {
-  const value = record[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return asFiniteNumber(record[key]);
 }
 
 function readBoolean(record: JsonObject, key: string): boolean | undefined {
-  const value = record[key];
-  return typeof value === "boolean" ? value : undefined;
+  return asBoolean(record[key]);
 }
 
 function readBooleanAlias(record: JsonObject, keys: readonly string[]): boolean | undefined {
@@ -1776,6 +1805,10 @@ function shouldSynthesizeToolProgressForItem(item: CodexThreadItem): boolean {
   }
 }
 
+function shouldRecordNativeToolTranscript(item: CodexThreadItem): boolean {
+  return shouldSynthesizeToolProgressForItem(item) && item.type !== "webSearch";
+}
+
 function isMutatingNativeToolItem(item: CodexThreadItem): boolean {
   return item.type === "commandExecution" || item.type === "fileChange";
 }
@@ -1830,13 +1863,46 @@ function itemToolArgs(item: CodexThreadItem): Record<string, unknown> | undefine
       changes: itemFileChanges(item),
     });
   }
-  if (item.type === "webSearch" && typeof item.query === "string") {
-    return sanitizeCodexAgentEventRecord({ query: item.query });
+  if (item.type === "webSearch") {
+    return webSearchToolArgs(item);
   }
   if (item.type === "dynamicToolCall" || item.type === "mcpToolCall") {
     return sanitizeCodexToolArguments(item.arguments);
   }
   return undefined;
+}
+
+function webSearchToolArgs(item: CodexThreadItem): Record<string, unknown> {
+  const action = isJsonObject(item.action) ? item.action : undefined;
+  const actionType = action ? readNonEmptyString(action, "type") : undefined;
+  const queries =
+    action && actionType === "search" ? readNonEmptyStringArray(action, "queries") : [];
+  const query =
+    normalizeNonEmptyString(item.query) ??
+    (action && actionType === "search" ? readNonEmptyString(action, "query") : undefined) ??
+    queries[0];
+  const url = action ? readNonEmptyString(action, "url") : undefined;
+  const pattern = action ? readNonEmptyString(action, "pattern") : undefined;
+  const args: Record<string, unknown> = {};
+  if (query) {
+    args.query = query;
+  }
+  if (queries.length > 0) {
+    args.queries = queries;
+  }
+  if (actionType && actionType !== "search") {
+    args.action = actionType;
+  }
+  if (url) {
+    args.url = url;
+  }
+  if (pattern) {
+    args.pattern = pattern;
+  }
+  if (!query && !url && !pattern) {
+    args.queryUnavailable = true;
+  }
+  return sanitizeCodexAgentEventRecord(args);
 }
 
 function itemToolResult(item: CodexThreadItem): { result?: Record<string, unknown> } {
@@ -1868,9 +1934,17 @@ function itemToolResult(item: CodexThreadItem): { result?: Record<string, unknow
     };
   }
   if (item.type === "webSearch") {
-    return { result: sanitizeCodexAgentEventRecord({ status: "completed" }) };
+    return { result: webSearchToolResult(item) };
   }
   return {};
+}
+
+function webSearchToolResult(item: CodexThreadItem): Record<string, unknown> {
+  return sanitizeCodexAgentEventRecord({
+    status: itemStatus(item),
+    ...(typeof item.durationMs === "number" ? { durationMs: item.durationMs } : {}),
+    ...webSearchToolArgs(item),
+  });
 }
 
 function itemFileChanges(item: CodexThreadItem): Array<{ path: string; kind: string }> {
@@ -1907,8 +1981,8 @@ function itemMeta(
       { detailMode },
     );
   }
-  if (item.type === "webSearch" && typeof item.query === "string") {
-    return item.query;
+  if (item.type === "webSearch") {
+    return inferToolMetaFromArgs("web_search", webSearchToolArgs(item), { detailMode });
   }
   const toolName = itemName(item);
   if ((item.type === "dynamicToolCall" || item.type === "mcpToolCall") && toolName) {

@@ -7,6 +7,7 @@ import { inspectPortUsage } from "../infra/ports.js";
 import { getWindowsInstallRoots } from "../infra/windows-install-roots.js";
 import { killProcessTree } from "../process/kill-tree.js";
 import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import { uniqueStrings } from "../shared/string-normalization.js";
 import { sleep } from "../utils.js";
 import { parseCmdScriptCommandLine, quoteCmdScriptArg } from "./cmd-argv.js";
 import { assertNoCmdLineBreak, parseCmdSetAssignment, renderCmdSetAssignment } from "./cmd-set.js";
@@ -37,6 +38,7 @@ function resolveTaskName(env: GatewayServiceEnv): string {
 
 function shouldFallbackToStartupEntry(params: { code: number; detail: string }): boolean {
   return (
+    params.code === 1 ||
     /(?:access is denied|acceso denegado)/i.test(params.detail) ||
     params.code === 124 ||
     /schtasks timed out/i.test(params.detail) ||
@@ -96,7 +98,7 @@ function resolveStartupEntryPath(env: GatewayServiceEnv, extension?: "cmd" | "vb
 function resolveStartupEntryPaths(env: GatewayServiceEnv): string[] {
   const primaryPath = resolveStartupEntryPath(env);
   const legacyCmdPath = resolveStartupEntryPath(env, "cmd");
-  return Array.from(new Set([primaryPath, legacyCmdPath]));
+  return uniqueStrings([primaryPath, legacyCmdPath]);
 }
 
 // `/TR` is parsed by schtasks itself, while the generated `gateway.cmd` line is parsed by cmd.exe.

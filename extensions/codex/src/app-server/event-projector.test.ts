@@ -20,7 +20,6 @@ import {
   type CodexAppServerEventProjectorOptions,
   type CodexAppServerToolTelemetry,
 } from "./event-projector.js";
-import { CodexNativeSubagentTaskMirror } from "./native-subagent-task-mirror.js";
 import { rememberCodexRateLimits, resetCodexRateLimitCacheForTests } from "./rate-limit-cache.js";
 import { createCodexTestModel } from "./test-support.js";
 
@@ -719,7 +718,7 @@ describe("CodexAppServerEventProjector", () => {
 
     expect(result.promptError).toContain("You've reached your Codex subscription usage limit.");
     expect(result.promptError).toContain("Next reset in");
-    expect(result.promptError).toContain("Run /codex account");
+    expect(result.promptError).toContain("Wait until the reset time");
     expect(result.promptErrorSource).toBe("prompt");
   });
 
@@ -994,36 +993,6 @@ describe("CodexAppServerEventProjector", () => {
 
     const result = projector.buildResult(buildEmptyToolTelemetry());
     expect(result.assistantTexts).toStrictEqual([]);
-  });
-
-  it("mirrors native subagent notifications before current-turn filtering", async () => {
-    const projector = await createProjector({
-      ...(await createParams()),
-      sessionKey: "agent:main:main",
-    } as EmbeddedRunAttemptParams);
-    const mirrorSpy = vi.spyOn(CodexNativeSubagentTaskMirror.prototype, "handleNotification");
-    const notification = {
-      method: "item/completed",
-      params: {
-        threadId: THREAD_ID,
-        turnId: "child-turn",
-        item: {
-          type: "collabAgentToolCall",
-          tool: "spawnAgent",
-          senderThreadId: THREAD_ID,
-          receiverThreadIds: ["child-thread"],
-          agentsStates: {
-            "child-thread": { status: "completed", message: "done" },
-          },
-        },
-      },
-    } as ProjectorNotification;
-
-    await projector.handleNotification(notification);
-
-    expect(mirrorSpy).toHaveBeenCalledWith(notification);
-    const result = projector.buildResult(buildEmptyToolTelemetry());
-    expect(result.assistantTexts).toEqual([]);
   });
 
   it("ignores notifications that omit top-level thread and turn ids", async () => {
@@ -1978,7 +1947,88 @@ describe("CodexAppServerEventProjector", () => {
     expect(event.params).toEqual({ query: "native tool observability" });
     expect(event.runId).toBe("run-1");
     expect(event.toolCallId).toBe("search-observed");
-    expect(event.result).toEqual({ status: "completed" });
+    expect(event.result).toEqual({
+      status: "completed",
+      durationMs: 5,
+      query: "native tool observability",
+    });
+  });
+
+  it("uses Codex web search action metadata when the top-level query is empty", async () => {
+    const afterToolCall = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "after_tool_call", handler: afterToolCall }]),
+    );
+    const projector = await createProjector();
+
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: {
+          type: "webSearch",
+          id: "search-observed",
+          query: "",
+          action: {
+            type: "search",
+            query: "native action query",
+            queries: ["native action query", "secondary query"],
+          },
+          status: "completed",
+          durationMs: 5,
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(afterToolCall).toHaveBeenCalledTimes(1));
+    const event = requireRecord(
+      mockCallArg(afterToolCall, 0, 0, "after_tool_call event"),
+      "after_tool_call event",
+    );
+    expect(event.toolName).toBe("web_search");
+    expect(event.params).toEqual({
+      query: "native action query",
+      queries: ["native action query", "secondary query"],
+    });
+    expect(event.result).toEqual({
+      status: "completed",
+      durationMs: 5,
+      query: "native action query",
+      queries: ["native action query", "secondary query"],
+    });
+  });
+
+  it("marks unavailable Codex web search queries explicitly", async () => {
+    const afterToolCall = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "after_tool_call", handler: afterToolCall }]),
+    );
+    const projector = await createProjector();
+
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: {
+          type: "webSearch",
+          id: "search-observed",
+          query: "",
+          action: { type: "other" },
+          status: "completed",
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(afterToolCall).toHaveBeenCalledTimes(1));
+    const event = requireRecord(
+      mockCallArg(afterToolCall, 0, 0, "after_tool_call event"),
+      "after_tool_call event",
+    );
+    expect(event.params).toEqual({
+      action: "other",
+      queryUnavailable: true,
+    });
+    expect(event.result).toEqual({
+      status: "completed",
+      action: "other",
+      queryUnavailable: true,
+    });
   });
 
   it("records dynamic OpenClaw tool calls in mirrored transcript snapshots", async () => {
@@ -2029,6 +2079,87 @@ describe("CodexAppServerEventProjector", () => {
     expect(toolResultContent.toolName).toBe("browser");
     expect(toolResultContent.toolCallId).toBe("call-browser-1");
     expect(toolResultContent.content).toBe("opened");
+  });
+
+  it("does not mirror Codex-native web searches into transcript snapshots", async () => {
+    const projector = await createProjector();
+
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: {
+          type: "webSearch",
+          id: "search-observed",
+          status: "completed",
+          durationMs: 5,
+        },
+      }),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(
+      result.messagesSnapshot.some((message) => {
+        const record = message as unknown as Record<string, unknown>;
+        if (record.role === "toolResult") {
+          return true;
+        }
+        const content = Array.isArray(record.content) ? record.content : [];
+        return content.some((entry) => {
+          return (
+            typeof entry === "object" &&
+            entry !== null &&
+            (entry as Record<string, unknown>).type === "toolCall"
+          );
+        });
+      }),
+    ).toBe(false);
+  });
+
+  it("carries async-started dynamic tool metadata into attempt results", async () => {
+    const projector = await createProjector();
+
+    projector.recordDynamicToolCall({
+      callId: "call-image-1",
+      tool: "image_generate",
+      arguments: { action: "generate", prompt: "lighthouse" },
+    });
+    projector.recordDynamicToolResult({
+      callId: "call-image-1",
+      tool: "image_generate",
+      asyncStarted: true,
+      success: true,
+      sideEffectEvidence: true,
+      contentItems: [{ type: "inputText", text: "Background task started." }],
+    });
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: {
+          type: "dynamicToolCall",
+          id: "call-image-1",
+          namespace: null,
+          tool: "image_generate",
+          arguments: { action: "generate", prompt: "lighthouse" },
+          status: "completed",
+          contentItems: [{ type: "inputText", text: "Background task started." }],
+          success: true,
+          durationMs: 10,
+        },
+      }),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(result.toolMetas).toEqual([
+      {
+        toolName: "image_generate",
+        meta: "lighthouse",
+        asyncStarted: true,
+      },
+    ]);
+    expect(result.replayMetadata).toEqual({
+      hadPotentialSideEffects: true,
+      replaySafe: false,
+    });
   });
 
   it("emits verbose summaries for transcript-recorded dynamic tool calls", async () => {

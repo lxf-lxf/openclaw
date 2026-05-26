@@ -106,6 +106,17 @@ done
 TRASH
   chmod +x /tmp/openclaw-bin/trash
 }
+openclaw_e2e_run_script_with_pty() {
+  local command="$1"
+  local log_path="$2"
+  if script --version >/dev/null 2>&1; then
+    script -q -f -c "$command" "$log_path"
+  elif node -e 'import("@lydell/node-pty")' >/dev/null 2>&1; then
+    node scripts/e2e/lib/run-with-pty.mjs "$log_path" /bin/bash -lc "$command"
+  else
+    script -q -F "$log_path" /bin/bash -lc "$command"
+  fi
+}
 openclaw_e2e_stop_process() {
   local pid="${1:-}" _
   [ -n "$pid" ] || return 0

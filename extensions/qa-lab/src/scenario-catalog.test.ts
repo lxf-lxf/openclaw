@@ -90,6 +90,9 @@ describe("qa scenario catalog", () => {
     expect(fallbackConfig?.gracefulFallbackAny as string[] | undefined).toContain(
       "will not reveal",
     );
+    expect(JSON.stringify(readQaScenarioById("memory-failure-fallback").execution.flow)).toContain(
+      "liveTurnTimeoutMs(env, 180000)",
+    );
     expect(bundledSkill.title).toBe("Bundled plugin skill runtime");
     expect(bundledSkillConfig?.pluginId).toBe("open-prose");
     expect(bundledSkillConfig?.expectedSkillName).toBe("prose");
@@ -194,12 +197,41 @@ describe("qa scenario catalog", () => {
     expect(readQaScenarioById("long-context-progress-watchdog").sourcePath).toBe(
       "qa/scenarios/runtime/long-context-progress-watchdog.md",
     );
+    expect(JSON.stringify(readQaScenarioById("gateway-restart-inflight-run").execution.flow))
+      .toContain("EmbeddedAttemptSessionTakeoverError");
+    expect(JSON.stringify(readQaScenarioById("gateway-restart-inflight-run").execution.flow))
+      .toContain("AbortError");
+    expect(JSON.stringify(readQaScenarioById("gateway-restart-inflight-run").execution.flow))
+      .toContain("This operation was aborted");
+    expect(JSON.stringify(readQaScenarioById("gateway-restart-inflight-run").execution.flow))
+      .toContain("liveTurnTimeoutMs(env, 180000)");
     expect(readQaScenarioExecutionConfig("long-context-progress-watchdog")).toMatchObject({
       requiredProviderMode: "live-frontier",
       harnessRuntime: "codex",
     });
     expect(readQaScenarioById("long-context-progress-watchdog").plugins).toBeUndefined();
     expect(readQaScenarioById("long-context-progress-watchdog").gatewayConfigPatch).toBeUndefined();
+  });
+
+  it("loads the QA bus tool trace visibility harness scenario", () => {
+    const scenario = readQaScenarioById("qa-bus-tool-trace-visibility");
+    const config = readQaScenarioExecutionConfig(scenario.id) as
+      | {
+          expectedToolName?: string;
+          expectedRedaction?: string;
+          searchQuery?: string;
+        }
+      | undefined;
+
+    expect(scenario.sourcePath).toBe("qa/scenarios/runtime/qa-bus-tool-trace-visibility.md");
+    expect(scenario.coverage?.primary).toContain("harness.tool-trace-visibility");
+    expect(scenario.coverage?.secondary).toContain("runtime.qa-bus");
+    expect(config?.expectedToolName).toBe("exec");
+    expect(config?.expectedRedaction).toBe("[redacted]");
+    expect(config?.searchQuery).toBe("exec");
+    expect(scenario.execution.flow?.steps.map((step) => step.name)).toEqual([
+      "preserves searchable sanitized tool-call traces",
+    ]);
   });
 
   it("loads the opt-in update.run package self-upgrade sentinel", () => {
